@@ -14,15 +14,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODERATOR_TG_ID = os.getenv("MODER_ID")
 BOT_USERNAME = "abitohelp_bot"
 
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в .env")
-if not MODERATOR_TG_ID:
-    raise ValueError("❌ MODER_ID не найден в .env")
-
 try:
     MODERATOR_TG_ID = int(MODERATOR_TG_ID)
 except ValueError:
-    raise ValueError("❌ MODER_ID должен быть целым числом")
+    raise ValueError("MODER_ID должен быть целым числом")
 
 DB_PATH = "bot.db"
 
@@ -30,7 +25,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# === Инициализация БД ===
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -77,7 +71,6 @@ async def init_db():
         await db.commit()
 
 
-# === Генерация QR ===
 def generate_qr(data: str) -> BytesIO:
     qr = qrcode.QRCode(version=1, box_size=8, border=2)
     qr.add_data(data)
@@ -88,8 +81,6 @@ def generate_qr(data: str) -> BytesIO:
     bio.seek(0)
     return bio
 
-
-# === Клавиатуры ===
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -170,7 +161,7 @@ async def show_user_profile_preview(chat_id: int, target_id: int, viewer_id: int
 async def cmd_start(message: types.Message):
     user = message.from_user
 
-    # Сохраняем/обновляем пользователя
+    # Сохраняем пользователя
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (tg_id, full_name, username)
@@ -182,7 +173,6 @@ async def cmd_start(message: types.Message):
         await db.execute("INSERT OR IGNORE INTO notification_prefs (user_id) VALUES (?)", (user.id,))
         await db.commit()
 
-    # Обработка deep link
     payload = None
     if message.text and len(message.text) > 6:
         parts = message.text.split(maxsplit=1)
