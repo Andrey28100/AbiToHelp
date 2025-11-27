@@ -5,15 +5,14 @@ import qrcode
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from aiogram.types import BufferedInputFile
 
-# === Настройки ===
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODERATOR_TG_ID = os.getenv("MODER_ID")
+BOT_USERNAME = "abitohelp_bot"  # ← замени, если имя бота другое
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не найден в .env")
@@ -23,7 +22,7 @@ if not MODERATOR_TG_ID:
 try:
     MODERATOR_TG_ID = int(MODERATOR_TG_ID)
 except ValueError:
-    raise ValueError("❌ MODER_ID должен быть целым числом (ваш Telegram ID")
+    raise ValueError("❌ MODER_ID должен быть целым числом")
 
 DB_PATH = "bot.db"
 
@@ -31,7 +30,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# === Инициализация базы данных ===
+# === Инициализация БД ===
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -78,8 +77,7 @@ async def init_db():
         await db.commit()
 
 
-# === Вспомогательные функции ===
-
+# === Генерация QR ===
 def generate_qr(data: str) -> BytesIO:
     qr = qrcode.QRCode(version=1, box_size=8, border=2)
     qr.add_data(data)
@@ -97,6 +95,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🤖 О боте", callback_data="about_bot")
     builder.button(text="👤 Мой профиль", callback_data="my_profile")
+    builder.button(text="🎫 Мой QR-код", callback_data="my_qr_card")
     builder.button(text="🔔 Настройки уведомлений", callback_data="notif_settings")
     builder.adjust(1)
     return builder.as_markup()
@@ -129,11 +128,52 @@ def notif_toggle_kb(events_on: bool) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+# === Вспомогательная функция: показ профиля + регистраций другого пользователя ===
+async def show_user_profile_preview(chat_id: int, target_id: int, viewer_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT full_name, username, role FROM users WHERE tg_id = ?", (target_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await bot.send_message(chat_id, "❌ Пользователь не найден.")
+            return
+
+    full_name, username, role = row
+    role_name = {"applicant": "Абитуриент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
+
+    # Заголовок
+    if viewer_id == target_id:
+        header = "👤 <b>Ваш профиль</b>"
+    else:
+        header = f"👤 <b>Профиль пользователя</b> (ID: {target_id})"
+
+    text = f"{header}\n\nИмя: {full_name}\nРоль: {role_name}"
+
+    # Мероприятия
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT e.title, e.event_datetime FROM events e
+            JOIN registrations r ON e.id = r.event_id
+            WHERE r.user_id = ?
+        """, (target_id,))
+        events = await cursor.fetchall()
+
+    if events:
+        text += "\n\n✅ Зарегистрирован на:\n" + "\n".join(f"• {title} ({dt})" for title, dt in events)
+    else:
+        text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
+
+    await bot.send_message(chat_id, text, parse_mode="HTML")
+
+
 # === Обработчики ===
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user = message.from_user
+
+    # Сохраняем/обновляем пользователя
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT INTO users (tg_id, full_name, username)
@@ -145,14 +185,29 @@ async def cmd_start(message: types.Message):
         await db.execute("INSERT OR IGNORE INTO notification_prefs (user_id) VALUES (?)", (user.id,))
         await db.commit()
 
-    await message.answer(
-        "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
-        "Здесь вы можете:\n"
-        "• Получить QR-пропуск на мероприятия\n"
-        "• Узнать о событиях университета\n"
-        "• Настроить уведомления",
-        reply_markup=main_menu_kb()
-    )
+    # Обработка deep link
+    payload = None
+    if message.text and len(message.text) > 6:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            payload = parts[1].strip()
+
+    if payload and payload.isdigit():
+        target_id = int(payload)
+        if target_id == user.id:
+            await message.answer("✅ Вы перешли по своей QR-визитке!", reply_markup=back_kb())
+        else:
+            # Показываем профиль другого пользователя
+            await show_user_profile_preview(message.chat.id, target_id, user.id)
+    else:
+        await message.answer(
+            "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
+            "Здесь вы можете:\n"
+            "• Получить персональный QR-код\n"
+            "• Зарегистрироваться на мероприятия\n"
+            "• Настроить уведомления",
+            reply_markup=main_menu_kb()
+        )
 
 
 @dp.message(Command("add_event"))
@@ -161,12 +216,23 @@ async def cmd_add_event(message: types.Message):
         await message.answer("⚠️ Только модератор может добавлять мероприятия.")
         return
 
-    parts = message.text.split(" | ")
-    if len(parts) != 4:
+    # Извлекаем аргументы после команды
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
         await message.answer(
             "❗ Неверный формат.\n"
             "Используйте:\n"
             "/add_event Название | Описание | Дата (ГГГГ-ММ-ДД ЧЧ:ММ) | Место"
+        )
+        return
+
+    payload = args[1].strip()
+    parts = payload.split(" | ")
+    if len(parts) != 4:
+        await message.answer(
+            "❗ Неверное количество параметров.\n"
+            "Нужно ровно 4, разделённых ` | `:\n"
+            "Название | Описание | Дата | Место"
         )
         return
 
@@ -197,7 +263,7 @@ async def cmd_add_event(message: types.Message):
     await sent_msg.edit_reply_markup(reply_markup=event_register_kb(event_id))
     await message.answer(f"✅ Мероприятие создано! ID: {event_id}")
 
-    # Рассылка (опционально — для демо)
+    # Рассылка (опционально)
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             SELECT u.tg_id FROM users u
@@ -214,8 +280,8 @@ async def cmd_add_event(message: types.Message):
                 parse_mode="HTML",
                 reply_markup=event_register_kb(event_id)
             )
-        except Exception:
-            pass  # пользователь неактивен
+        except:
+            pass
 
 
 @dp.message(Command("moder"))
@@ -234,7 +300,7 @@ async def handle_callback(callback: types.CallbackQuery):
     user = callback.from_user
     data = callback.data
 
-    # === Регистрация на мероприятие ===
+    # === Регистрация на мероприятие (БЕЗ QR!) ===
     if data.startswith("reg_"):
         try:
             event_id = int(data.split("_", 1)[1])
@@ -257,39 +323,13 @@ async def handle_callback(callback: types.CallbackQuery):
                 await callback.answer("✅ Вы уже зарегистрированы!", show_alert=True)
                 return
 
-            # Сохраняем регистрацию
             await db.execute(
                 "INSERT INTO registrations (user_id, event_id) VALUES (?, ?)",
                 (user.id, event_id)
             )
             await db.commit()
 
-        # ✅ Генерируем и отправляем QR-пропуск
-        qr_payload = f"{user.id}:{event_id}"
-        qr_img = generate_qr(qr_payload)  # BytesIO
-        qr_bytes = qr_img.getvalue()
-
-        # Создаём файл для отправки
-        photo_file = BufferedInputFile(
-            file=qr_bytes,
-            filename="qr_pass.png"
-        )
-
-        caption = (
-            f"🎉 <b>Регистрация успешна!</b>\n\n"
-            f"Вот ваш QR-пропуск на мероприятие:\n"
-            f"<b>{event[0]}</b> (ID: {event_id})\n\n"
-            f"Покажите этот код при входе."
-        )
-
-        # Отправляем QR как новое сообщение
-        await callback.message.answer_photo(
-            photo=photo_file,
-            caption=caption,
-            parse_mode="HTML"
-        )
-
-        # Меняем кнопку на "✅ Зарегистрировано"
+        # ✅ УБРАН QR! Просто подтверждение.
         await callback.message.edit_reply_markup(reply_markup=event_registered_kb())
         await callback.answer("✅ Регистрация подтверждена!", show_alert=True)
         return
@@ -298,161 +338,57 @@ async def handle_callback(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # === О боте ===
     if data == "about_bot":
-        text = (
-            "🤖 <b>Бот абитуриента</b>\n\n"
-            "Помогает новым студентам:\n"
-            "• Ориентироваться в кампусе\n"
-            "• Регистрироваться на мероприятия\n"
-            "• Получать QR-пропуска\n\n"
-            "Разработан для хакатона университета."
-        )
+        text = "🤖 <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия."
         await callback.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
         await callback.answer()
         return
 
-    # === Мой профиль + QR ===
     if data == "my_profile":
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT full_name, username, role FROM users WHERE tg_id = ?",
-                (user.id,)
-            )
-            row = await cursor.fetchone()
-            if not row:
-                await callback.message.edit_text("❌ Профиль не найден. Напишите /start.")
-                return
-
-        full_name, username, role = row
-        role_name = {"applicant": "Абитуриент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
-        text = (
-            f"👤 <b>Ваш профиль</b>\n\n"
-            f"Имя: {full_name}\n"
-            f"Роль: {role_name}\n"
-            f"ID: <code>{user.id}</code>"
-        )
-
-        builder = InlineKeyboardBuilder()
-        builder.button(text="📄 Мои регистрации", callback_data="my_registrations")
-        builder.button(text="🎫 Получить QR-пропуск", callback_data="get_qr_all")
-        builder.button(text="⬅️ Назад", callback_data="back_to_main")
-        builder.adjust(1)
-        await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        await show_user_profile_preview(callback.message.chat.id, user.id, user.id)
         await callback.answer()
         return
 
-    if data == "my_registrations":
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                SELECT e.title, e.event_datetime FROM events e
-                JOIN registrations r ON e.id = r.event_id
-                WHERE r.user_id = ?
-            """, (user.id,))
-            rows = await cursor.fetchall()
-
-        if not rows:
-            text = "📭 Вы ещё не зарегистрированы ни на одно мероприятие."
-        else:
-            text = "✅ Ваши регистрации:\n\n"
-            for title, dt in rows:
-                text += f"• {title} ({dt})\n"
-
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⬅️ Назад", callback_data="my_profile")
-        await callback.message.edit_text(text, reply_markup=builder.as_markup())
-        await callback.answer()
-        return
-
-    if data == "get_qr_all":
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("""
-                SELECT event_id FROM registrations WHERE user_id = ?
-            """, (user.id,))
-            events = await cursor.fetchall()
-
-        if not events:
-            await callback.answer("❌ У вас нет регистраций для QR-пропуска.", show_alert=True)
-            return
-
-        # Берём первое мероприятие (можно позже сделать выбор из списка)
-        event_id = events[0][0]
-        qr_payload = f"{user.id}:{event_id}"  # Это то, что будет в QR
-        qr_img = generate_qr(qr_payload)
-
+    if data == "my_qr_card":
+        deeplink_url = f"https://t.me/{BOT_USERNAME}?start={user.id}"
+        qr_img = generate_qr(deeplink_url)
+        photo_file = BufferedInputFile(qr_img.getvalue(), filename="qr_vizitka.png")
         caption = (
-            f"🎫 <b>QR-пропуск</b>\n\n"
-            f"Скан этого кода подтвердит вашу регистрацию на мероприятие ID <code>{event_id}</code>.\n"
-            f"Ваш Telegram ID: <code>{user.id}</code>"
+            "🎫 <b>Ваш персональный QR-код</b>\n\n"
+            "При сканировании другие увидят ваш профиль и список мероприятий, на которые вы записаны.\n\n"
+            f"🔗 <code>{deeplink_url}</code>"
         )
-
-        await callback.message.answer_photo(
-            photo=qr_img,
-            caption=caption,
-            parse_mode="HTML"
-        )
+        await callback.message.answer_photo(photo=photo_file, caption=caption, parse_mode="HTML")
         await callback.answer()
         return
 
-    # === Настройки уведомлений ===
     if data == "notif_settings":
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT events_enabled FROM notification_prefs WHERE user_id = ?",
-                (user.id,)
-            )
+            cursor = await db.execute("SELECT events_enabled FROM notification_prefs WHERE user_id = ?", (user.id,))
             row = await cursor.fetchone()
-            if not row:
-                await callback.answer("❌ Настройки не найдены.")
-                return
-            events_on = bool(row[0])
-
-        await callback.message.edit_text(
-            "🔔 <b>Настройки уведомлений</b>",
-            reply_markup=notif_toggle_kb(events_on),
-            parse_mode="HTML"
-        )
+        events_on = bool(row[0]) if row else True
+        await callback.message.edit_text("🔔 <b>Настройки уведомлений</b>", reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
         await callback.answer()
         return
 
     if data == "toggle_events":
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                UPDATE notification_prefs
-                SET events_enabled = 1 - events_enabled
-                WHERE user_id = ?
-            """, (user.id,))
+            await db.execute("UPDATE notification_prefs SET events_enabled = 1 - events_enabled WHERE user_id = ?", (user.id,))
             await db.commit()
-
-        # Теперь НЕ вызываем handle_callback, а просто перерисовываем настройки
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute(
-                "SELECT events_enabled FROM notification_prefs WHERE user_id = ?",
-                (user.id,)
-            )
+            cursor = await db.execute("SELECT events_enabled FROM notification_prefs WHERE user_id = ?", (user.id,))
             row = await cursor.fetchone()
-            events_on = bool(row[0]) if row else True
-
-        await callback.message.edit_text(
-            "🔔 <b>Настройки уведомлений</b>",
-            reply_markup=notif_toggle_kb(events_on),
-            parse_mode="HTML"
-        )
+        events_on = bool(row[0]) if row else True
+        await callback.message.edit_text("🔔 <b>Настройки уведомлений</b>", reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
         await callback.answer()
         return
 
-    # === Панель модератора ===
     if data == "mod_stats":
         async with aiosqlite.connect(DB_PATH) as db:
-            users = await (await db.execute("SELECT COUNT(*) FROM users")).fetchone()
-            events = await (await db.execute("SELECT COUNT(*) FROM events")).fetchone()
-            regs = await (await db.execute("SELECT COUNT(*) FROM registrations")).fetchone()
-        text = (
-            "📊 <b>Статистика</b>\n\n"
-            f"Пользователей: {users[0]}\n"
-            f"Мероприятий: {events[0]}\n"
-            f"Регистраций: {regs[0]}"
-        )
+            users = (await db.execute("SELECT COUNT(*) FROM users")).fetchone()
+            events = (await db.execute("SELECT COUNT(*) FROM events")).fetchone()
+            regs = (await db.execute("SELECT COUNT(*) FROM registrations")).fetchone()
+        text = f"📊 <b>Статистика</b>\n\nПользователей: {users[0]}\nМероприятий: {events[0]}\nРегистраций: {regs[0]}"
         builder = InlineKeyboardBuilder()
         builder.button(text="⬅️ Назад", callback_data="back_to_moder")
         await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
@@ -460,7 +396,7 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "mod_broadcast_demo":
-        await callback.message.edit_text("📨 Рассылка запущена (демо-режим).", parse_mode="HTML")
+        await callback.message.edit_text("📨 Рассылка запущена (демо).")
         await callback.answer()
         return
 
@@ -473,13 +409,12 @@ async def handle_callback(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # === Назад в главное меню ===
     if data == "back_to_main":
         await callback.message.edit_text(
             "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
             "Здесь вы можете:\n"
-            "• Получить QR-пропуск на мероприятия\n"
-            "• Узнать о событиях университета\n"
+            "• Получить персональный QR-код\n"
+            "• Зарегистрироваться на мероприятия\n"
             "• Настроить уведомления",
             reply_markup=main_menu_kb()
         )
@@ -492,7 +427,8 @@ async def handle_callback(callback: types.CallbackQuery):
 # === Запуск ===
 async def main():
     await init_db()
-    print("✅ Бот запущен. База данных: bot.db")
+    me = await bot.get_me()
+    print(f"✅ Бот запущен как @{me.username}")
     await dp.start_polling(bot)
 
 
