@@ -1,7 +1,4 @@
-# Секреты
 .env
-*.env
-
-# Кэш Python
+bot.db
 __pycache__/
 *.pyc
