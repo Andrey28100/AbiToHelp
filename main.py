@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, BufferedInputFile, InputMediaAnimation
+from aiogram.types import InlineKeyboardMarkup, BufferedInputFile, InputMediaAnimation, InputMediaPhoto
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
@@ -28,8 +28,6 @@ except (ValueError, TypeError):
     raise ValueError("MODER_ID должен быть целым числом")
 
 DB_PATH = "bot.db"
-WELCOME_GIF_BYTES = None
-MODER_GIF_BYTES = None
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -40,8 +38,10 @@ dp = Dispatcher(storage=MemoryStorage())
 class EventCreation(StatesGroup):
     title = State()
     description = State()
-    event_datetime = State()  # формат: ГГГГ-ММ-ДД ЧЧ:ММ
+    event_datetime = State()      # ГГГГ-ММ-ДД ЧЧ:ММ
+    registration_deadline = State()
     location = State()
+    photo = State()
 
 class RoleAssignment(StatesGroup):
     waiting_for_user_id = State()
@@ -71,22 +71,13 @@ async def init_db():
             description TEXT,
             event_datetime TEXT,
             location TEXT,
+            registration_deadline TEXT,
+            photo_file_id TEXT,
             created_by INTEGER,
-            post_message_id INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(created_by) REFERENCES users(tg_id)
-        )""")
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS registrations (
-            user_id INTEGER,
-            event_id INTEGER,
-            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT DEFAULT 'confirmed',
-            FOREIGN KEY(user_id) REFERENCES users(tg_id),
-            FOREIGN KEY(event_id) REFERENCES events(id),
-            PRIMARY KEY(user_id, event_id)
-        )""")
+        )
+        """)
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS notification_prefs (
@@ -195,6 +186,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     builder.button(text="ℹ️ О боте", callback_data="about_bot")
     builder.button(text="👤 Мой профиль", callback_data="my_profile")
     builder.button(text="🎫 Мой QR-код", callback_data="my_qr_card")
+    builder.button(text="📅 Активные регистрации", callback_data="active_events")
     builder.button(text="🔔 Настройки уведомлений", callback_data="notif_settings")
     builder.adjust(1)
     return builder.as_markup()
@@ -307,7 +299,7 @@ async def cmd_start(message: types.Message):
             # Ставим attended = 1
             await db.execute("""
                 UPDATE registrations
-                SET status = "attended"
+                SET attended = 1
                 WHERE user_id = ? AND event_id = ?
             """, (attendee_id, event_id))
             await db.commit()
@@ -356,7 +348,7 @@ async def cmd_start(message: types.Message):
     else:
         welcome_file_id = await get_media_asset("welcome")
         caption = (
-            "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
+            "🎓 Добро пожаловать в бот поддержки абитуриентов и студентов ВГУ!\n\n"
             "Здесь вы можете:\n"
             "• Получить персональный QR-код\n"
             "• Зарегистрироваться на мероприятия\n"
@@ -426,21 +418,66 @@ async def process_datetime(message: types.Message, state: FSMContext):
 @dp.message(EventCreation.location)
 async def process_location(message: types.Message, state: FSMContext):
     await state.update_data(location=message.text.strip())
+    await message.answer(
+        "📸 (Опционально) Отправьте фото мероприятия или нажмите /skip, чтобы пропустить."
+    )
+    await state.set_state(EventCreation.photo)
 
-    # Получаем все данные
+
+@dp.message(Command("skip"))
+@dp.message(EventCreation.photo)
+async def process_photo(message: types.Message, state: FSMContext):
+    photo_file_id = None
+    if message.photo:
+        photo_file_id = message.photo[-1].file_id
+    # Если отправлено не фото — сохраняем как None
+
+    await state.update_data(photo_file_id=photo_file_id)
+
+    # Собираем все данные
+    data = await state.get_data()
+
+    # Запрашиваем дедлайн регистрации
+    await message.answer(
+        "⏰ Введите <b>дату и время окончания регистрации</b> в формате:\n"
+        "<code>ГГГГ-ММ-ДД ЧЧ:ММ</code>\n\n"
+        "Пример: <code>2025-12-09 18:00</code>",
+        parse_mode="HTML"
+    )
+    await state.set_state(EventCreation.registration_deadline)
+
+
+@dp.message(EventCreation.registration_deadline)
+async def process_reg_deadline(message: types.Message, state: FSMContext):
+    user_input = message.text.strip()
+    import re
+    if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", user_input):
+        await message.answer(
+            "❌ Неверный формат.\n"
+            "Пожалуйста, используйте: <code>ГГГГ-ММ-ДД ЧЧ:ММ</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    await state.update_data(registration_deadline=user_input)
+
+    # Сохраняем всё
     data = await state.get_data()
     title = data["title"]
     description = data["description"]
     event_datetime = data["event_datetime"]
+    reg_deadline = data["registration_deadline"]
     location = data["location"]
+    photo_file_id = data.get("photo_file_id")
     creator_id = message.from_user.id
 
-    # Сохраняем в БД
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
-            INSERT INTO events (title, description, event_datetime, location, created_by)
-            VALUES (?, ?, ?, ?, ?)
-        """, (title, description, event_datetime, location, creator_id))
+            INSERT INTO events (
+                title, description, event_datetime, registration_deadline,
+                location, photo_file_id, created_by
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (title, description, event_datetime, reg_deadline, location, photo_file_id, creator_id))
         event_id = cursor.lastrowid
         await db.commit()
 
@@ -449,11 +486,22 @@ async def process_location(message: types.Message, state: FSMContext):
     post_text = (
         f"🎉 <b>{title}</b>\n\n"
         f"{description}\n\n"
-        f"📅 {event_datetime}\n"
+        f"📅 Мероприятие: {event_datetime}\n"
+        f"⏳ Регистрация до: {reg_deadline}\n"
         f"📍 {location}\n\n"
         f"{event_tag}"
     )
-    sent_msg = await message.answer(post_text, parse_mode="HTML")
+
+    # Отправляем с фото (если есть)
+    if photo_file_id:
+        sent_msg = await message.answer_photo(
+            photo=photo_file_id,
+            caption=post_text,
+            parse_mode="HTML"
+        )
+    else:
+        sent_msg = await message.answer(post_text, parse_mode="HTML")
+
     await sent_msg.edit_reply_markup(reply_markup=event_register_kb(event_id))
 
     # Рассылка
@@ -467,17 +515,26 @@ async def process_location(message: types.Message, state: FSMContext):
 
     for (tg_id,) in users:
         try:
-            await bot.send_message(
-                tg_id,
-                f"📬 <b>Новое мероприятие!</b>\n\n{post_text}",
-                parse_mode="HTML",
-                reply_markup=event_register_kb(event_id)
-            )
+            if photo_file_id:
+                await bot.send_photo(
+                    tg_id,
+                    photo=photo_file_id,
+                    caption=f"📬 <b>Новое мероприятие!</b>\n\n{post_text}",
+                    parse_mode="HTML",
+                    reply_markup=event_register_kb(event_id)
+                )
+            else:
+                await bot.send_message(
+                    tg_id,
+                    f"📬 <b>Новое мероприятие!</b>\n\n{post_text}",
+                    parse_mode="HTML",
+                    reply_markup=event_register_kb(event_id)
+                )
         except Exception:
-            pass  # игнорируем заблокировавших
+            pass
 
     await message.answer(f"✅ Мероприятие создано! ID: {event_id}")
-    await state.clear()  # выходим из FSM
+    await state.clear()
 
 
 @dp.message(Command("moder"))
@@ -780,6 +837,7 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
     if data == "my_profile":
         # Получаем видео, если есть
         profile_video_id = await get_media_asset("profile")
+        text = ""
         
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
@@ -794,16 +852,22 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
                 role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
 
                 cursor = await db.execute("""
-                    SELECT e.title, e.event_datetime FROM events e
+                    SELECT e.title, e.event_datetime, r.status, r.attended
+                    FROM events e
                     JOIN registrations r ON e.id = r.event_id
                     WHERE r.user_id = ?
                 """, (user.id,))
                 events = await cursor.fetchall()
 
-
-                text = f"👤 <b>Ваш профиль</b>\n\nИмя: {full_name}\nРоль: {role_name}"
                 if events:
-                    text += "\n\n✅ Зарегистрирован на:\n" + "\n".join(f"• {title} ({dt})" for title, dt in events)
+                    lines = []
+                    for title, dt, status, attended in events:
+                        if attended:
+                            mark = "👤 Посетил"
+                        else:
+                            mark = "✅ Зарегистрирован"
+                        lines.append(f"• {title} ({dt}) — {mark}")
+                    text += "\n\n📋 Ваши мероприятия:\n" + "\n".join(lines)
                 else:
                     text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
 
@@ -831,14 +895,14 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
     if data == "my_qr_card":
         # QR — отдельное сообщение (не редактируем текущее)
         deeplink_url = f"https://t.me/{BOT_USERNAME}?start={user.id}"
-        qr_gif = generate_qr_gif(deeplink_url)
+        qr_gif = generate_qr(deeplink_url)
         gif_file = BufferedInputFile(qr_gif.getvalue(), filename="qr_vizitka.gif")
         caption = (
             "🎫 <b>Ваш персональный QR-код</b>\n\n"
             "При сканировании другие увидят ваш профиль и список мероприятий, на которые вы записаны.\n\n"
             f"🔗 <code>{deeplink_url}</code>"
         )
-        media = InputMediaAnimation(
+        media = InputMediaPhoto(
             media=gif_file,
             caption=caption,
             parse_mode="HTML"
@@ -945,9 +1009,9 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
     if data.startswith("gen_qr_checkin_"):
         event_id = int(data.split("_")[-1])
         deeplink = f"https://t.me/{BOT_USERNAME}?start=checkin_{event_id}_{user.id}"
-        qr_gif = generate_qr_gif(deeplink)
+        qr_gif = generate_qr(deeplink)
 
-        media = InputMediaAnimation(
+        media = InputMediaPhoto(
                 media=BufferedInputFile(qr_gif.getvalue(), filename=f"qr_checkin_{event_id}.gif"),
                 caption=f"🎫 QR для отметки на мероприятии\n\nПокажите его модератору при входе.",
                 parse_mode="HTML"
@@ -960,6 +1024,59 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
+
+    if data == "active_events":
+        user_id = callback.from_user.id
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Выбираем мероприятия, где регистрация ещё открыта И пользователь не зарегистрирован
+            cursor = await db.execute("""
+                SELECT e.id, e.title, e.registration_deadline, e.photo_file_id
+                FROM events e
+                WHERE datetime(e.registration_deadline) >= datetime('now')
+                AND NOT EXISTS (
+                    SELECT 1 FROM registrations r
+                    WHERE r.user_id = ? AND r.event_id = e.id
+                )
+                ORDER BY e.registration_deadline
+            """, (user_id,))
+            events = await cursor.fetchall()
+
+        if not events:
+            welcome_file_id = await get_media_asset("welcome")
+            media = InputMediaAnimation(
+                media=welcome_file_id,
+                caption="📭 Нет мероприятий с открытой регистрацией.",
+                parse_mode="HTML"
+            )
+            await callback.message.edit_media(
+                media=media,
+                reply_markup=back_kb(),
+                parse_mode="HTML"
+            )
+            await callback.answer()
+            return
+
+        # Покажем первое мероприятие
+        event_id, title, reg_deadline, photo_id = events[0]
+        text = f"🎉 <b>{title}</b>\n⏳ Регистрация до: {reg_deadline}"
+
+        # Клавиатура с навигацией
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✅ Зарегистрироваться", callback_data=f"reg_{event_id}")
+        if len(events) > 1:
+            builder.button(text="⏭️ Далее", callback_data=f"next_event_0")  # индекс текущего
+        builder.button(text="⬅️ Назад", callback_data="back_to_main")
+        builder.adjust(1)
+
+        if photo_id:
+            media = InputMediaPhoto(media=photo_id, caption=text, parse_mode="HTML")
+            await callback.message.edit_media(media=media, reply_markup=builder.as_markup())
+        else:
+            await callback.message.edit_text(text=text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+        # Сохрани список в state (для навигации)
+        await callback.answer()
 
     # === Модераторка (редактируем caption) ===
 
@@ -1032,7 +1149,7 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
     if data == "back_to_main":
         welcome_file_id = await get_media_asset("welcome")
         caption = (
-            "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
+            "🎓 Добро пожаловать в бот поддержки абитуриентов и студентов ВГУ!\n\n"
             "Здесь вы можете:\n"
             "• Получить персональный QR-код\n"
             "• Зарегистрироваться на мероприятия\n"
