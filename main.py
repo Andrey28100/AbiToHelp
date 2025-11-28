@@ -5,35 +5,37 @@ import qrcode
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, BufferedInputFile
+from aiogram.types import InlineKeyboardMarkup, BufferedInputFile, InputMediaAnimation
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 
+# === Конфигурация ===
 WELCOME_GIF_PATH = "bot.mp4"
-
-def load_welcome_gif() -> bytes:
-    if not os.path.exists(WELCOME_GIF_PATH):
-        raise FileNotFoundError(f"Файл {WELCOME_GIF_PATH} не найден!")
-    with open(WELCOME_GIF_PATH, "rb") as f:
-        return f.read()
-
-WELCOME_GIF_BYTES = None        
+MODER_GIF_PATH = "moder.mp4"
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODERATOR_TG_ID = os.getenv("MODER_ID")
 BOT_USERNAME = "abitohelp_bot"
 
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в .env")
+
 try:
     MODERATOR_TG_ID = int(MODERATOR_TG_ID)
-except ValueError:
+except (ValueError, TypeError):
     raise ValueError("MODER_ID должен быть целым числом")
 
 DB_PATH = "bot.db"
+WELCOME_GIF_BYTES = None
+MODER_GIF_BYTES = None
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+
+# === Вспомогательные функции ===
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -81,6 +83,21 @@ async def init_db():
         await db.commit()
 
 
+def load_welcome_gif() -> bytes:
+    if not os.path.exists(WELCOME_GIF_PATH):
+        raise FileNotFoundError(f"Файл {WELCOME_GIF_PATH} не найден!")
+    with open(WELCOME_GIF_PATH, "rb") as f:
+        return f.read()
+
+
+def load_moder_gif() -> bytes:
+    if not os.path.exists(MODER_GIF_PATH):
+        # Fallback на основной GIF, если moder.mp4 нет
+        return load_welcome_gif()
+    with open(MODER_GIF_PATH, "rb") as f:
+        return f.read()
+
+
 def generate_qr(data: str) -> BytesIO:
     qr = qrcode.QRCode(version=1, box_size=8, border=2)
     qr.add_data(data)
@@ -93,15 +110,15 @@ def generate_qr(data: str) -> BytesIO:
 
 
 async def has_admin_access(tg_id: int) -> bool:
-    # Доступ по .env (для первоначальной настройки)
     if tg_id == MODERATOR_TG_ID:
         return True
-    # Или по роли в БД
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("SELECT role FROM users WHERE tg_id = ?", (tg_id,))
         row = await cursor.fetchone()
         return bool(row and row[0] == "moderator")
 
+
+# === Клавиатуры ===
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -113,9 +130,26 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def moder_menu_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📊 Статистика", callback_data="mod_stats")
+    builder.button(text="➕ Создать мероприятие", callback_data="mod_create_event")
+    builder.button(text="👤 Назначить роль", callback_data="mod_set_role")
+    builder.button(text="📨 Рассылка", callback_data="mod_broadcast")
+    builder.button(text="🔍 Найти пользователя", callback_data="mod_search_user")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def back_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    return builder.as_markup()
+
+
+def back_to_moder_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data="back_to_moder")
     return builder.as_markup()
 
 
@@ -139,6 +173,8 @@ def notif_toggle_kb(events_on: bool) -> InlineKeyboardMarkup:
     builder.adjust(1)
     return builder.as_markup()
 
+
+# === Обработчики ===
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -164,10 +200,8 @@ async def cmd_start(message: types.Message):
     if payload and payload.isdigit():
         target_id = int(payload)
         if target_id == user.id:
-            # Это своя визитка — НЕ показываем GIF
-            await message.answer("✅ Вы перешли по своей QR-визитке!", reply_markup=back_kb())
+            await message.answer("✅ Вы перешли по своей QR-визитке!")
         else:
-            # Просмотр чужого профиля — НЕ показываем GIF
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute("SELECT full_name, username, role FROM users WHERE tg_id = ?", (target_id,))
                 row = await cursor.fetchone()
@@ -192,7 +226,7 @@ async def cmd_start(message: types.Message):
 
                     await message.answer(text, parse_mode="HTML")
     else:
-        # Основной старт — ПОКАЗЫВАЕМ GIF
+        # Главное меню — анимация с подписью и кнопками
         gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
         await message.answer_animation(
             animation=gif_file,
@@ -203,16 +237,19 @@ async def cmd_start(message: types.Message):
                 "• Зарегистрироваться на мероприятия\n"
                 "• Настроить уведомления"
             ),
-            reply_markup=main_menu_kb()
+            reply_markup=main_menu_kb(),
+            parse_mode="HTML"
         )
+
+
+# === Команды модератора (без изменений) ===
 
 @dp.message(Command("add_event"))
 async def cmd_add_event(message: types.Message):
-    if not has_admin_access(message.from_user.id):
+    if not await has_admin_access(message.from_user.id):
         await message.answer("⚠️ Только модератор может добавлять мероприятия.")
         return
 
-    # Извлекаем аргументы после команды
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer(
@@ -251,15 +288,9 @@ async def cmd_add_event(message: types.Message):
         f"{event_tag}"
     )
     sent_msg = await message.answer(post_text, parse_mode="HTML")
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE events SET post_message_id = ? WHERE id = ?", (sent_msg.message_id, event_id))
-        await db.commit()
-
     await sent_msg.edit_reply_markup(reply_markup=event_register_kb(event_id))
     await message.answer(f"✅ Мероприятие создано! ID: {event_id}")
 
-    # Рассылка (опционально)
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             SELECT u.tg_id FROM users u
@@ -282,21 +313,21 @@ async def cmd_add_event(message: types.Message):
 
 @dp.message(Command("moder"))
 async def cmd_moder(message: types.Message):
-    if not has_admin_access(message.from_user.id):
+    if not await has_admin_access(message.from_user.id):
         return
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📊 Статистика", callback_data="mod_stats")
-    builder.button(text="➕ Создать мероприятие", callback_data="mod_create_event")
-    builder.button(text="👤 Назначить роль", callback_data="mod_set_role")
-    builder.button(text="📨 Рассылка", callback_data="mod_broadcast")
-    builder.button(text="🔍 Найти пользователя", callback_data="mod_search_user")
-    builder.adjust(1)
-    await message.answer("🛠 <b>Панель модератора</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
+
+    gif_file = BufferedInputFile(MODER_GIF_PATH, filename="moder.mp4")
+    await message.answer_animation(
+        animation=gif_file,
+        caption="🛠 <b>Панель модератора</b>",
+        reply_markup=moder_menu_kb(),
+        parse_mode="HTML"
+    )
 
 
 @dp.message(Command("set_role"))
 async def cmd_set_role(message: types.Message):
-    if not has_admin_access(message.from_user.id):
+    if not await has_admin_access(message.from_user.id):
         await message.answer("⚠️ Только модератор может менять роли.")
         return
 
@@ -315,7 +346,6 @@ async def cmd_set_role(message: types.Message):
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Убедимся, что пользователь существует
         cursor = await db.execute("SELECT 1 FROM users WHERE tg_id = ?", (tg_id,))
         if not await cursor.fetchone():
             await message.answer("❌ Пользователь не найден. Он должен написать боту /start.")
@@ -327,6 +357,8 @@ async def cmd_set_role(message: types.Message):
     role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}[new_role]
     await message.answer(f"✅ Роль пользователя {tg_id} изменена на: {role_name}")
 
+
+# === Обработчик кнопок — ТОЛЬКО edit_caption! ===
 
 @dp.callback_query()
 async def handle_callback(callback: types.CallbackQuery):
@@ -369,14 +401,11 @@ async def handle_callback(callback: types.CallbackQuery):
         await callback.answer()
         return
 
+    # === Все экраны — через edit_caption ===
+
     if data == "about_bot":
-        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
-        await callback.message.answer_animation(
-            animation=gif_file,
-            caption="🤖 <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия.",
-            reply_markup=back_kb(),
-            parse_mode="HTML"
-        )
+        caption = "🤖 <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия."
+        await callback.message.edit_caption(caption=caption, reply_markup=back_kb(), parse_mode="HTML")
         await callback.answer()
         return
 
@@ -389,14 +418,14 @@ async def handle_callback(callback: types.CallbackQuery):
             )
             row = await cursor.fetchone()
             if not row:
-                await callback.message.edit_text("❌ Профиль не найден. Напишите /start.")
+                caption = "❌ Профиль не найден. Напишите /start."
+                await callback.message.edit_caption(caption=caption, reply_markup=back_kb())
                 await callback.answer()
                 return
 
             full_name, username, role = row
-            role_name = {"applicant": "Абитуриент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
+            role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
 
-            # Получаем мероприятия
             cursor = await db.execute("""
                 SELECT e.title, e.event_datetime FROM events e
                 JOIN registrations r ON e.id = r.event_id
@@ -410,20 +439,12 @@ async def handle_callback(callback: types.CallbackQuery):
         else:
             text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
 
-        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
-        caption = text  # тот самый text с профилем
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⬅️ Назад", callback_data="back_to_main")
-        await callback.message.answer_animation(
-            animation=gif_file,
-            caption=caption,
-            reply_markup=builder.as_markup(),
-            parse_mode="HTML"
-        )
+        await callback.message.edit_caption(caption=text, reply_markup=back_kb(), parse_mode="HTML")
         await callback.answer()
         return
 
     if data == "my_qr_card":
+        # QR — отдельное сообщение (не редактируем текущее)
         deeplink_url = f"https://t.me/{BOT_USERNAME}?start={user.id}"
         qr_img = generate_qr(deeplink_url)
         photo_file = BufferedInputFile(qr_img.getvalue(), filename="qr_vizitka.png")
@@ -442,13 +463,8 @@ async def handle_callback(callback: types.CallbackQuery):
             row = await cursor.fetchone()
         events_on = bool(row[0]) if row else True
 
-        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
-        await callback.message.answer_animation(
-            animation=gif_file,
-            caption="🔔 <b>Настройки уведомлений</b>",
-            reply_markup=notif_toggle_kb(events_on),
-            parse_mode="HTML"
-        )
+        caption = "🔔 <b>Настройки уведомлений</b>"
+        await callback.message.edit_caption(caption=caption, reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
         await callback.answer()
         return
 
@@ -460,43 +476,33 @@ async def handle_callback(callback: types.CallbackQuery):
             cursor = await db.execute("SELECT events_enabled FROM notification_prefs WHERE user_id = ?", (user.id,))
             row = await cursor.fetchone()
         events_on = bool(row[0]) if row else True
-        await callback.message.edit_text("🔔 <b>Настройки уведомлений</b>", reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
+        caption = "🔔 <b>Настройки уведомлений</b>"
+        await callback.message.edit_caption(caption=caption, reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
         await callback.answer()
         return
+
+    # === Модераторка (редактируем caption) ===
 
     if data == "mod_stats":
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("SELECT COUNT(*) FROM users")
-            users = await cursor.fetchone()
-
+            users = (await cursor.fetchone())[0]
             cursor = await db.execute("SELECT COUNT(*) FROM events")
-            events = await cursor.fetchone()
-
+            events = (await cursor.fetchone())[0]
             cursor = await db.execute("SELECT COUNT(*) FROM registrations")
-            regs = await cursor.fetchone()
-        text = f"📊 <b>Статистика</b>\n\nПользователей: {users[0]}\nМероприятий: {events[0]}\nРегистраций: {regs[0]}"
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⬅️ Назад", callback_data="back_to_moder")
-        await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
-        await callback.answer()
-        return
-
-    if data == "mod_broadcast_demo":
-        await callback.message.edit_text("📨 Рассылка запущена (демо).")
+            regs = (await cursor.fetchone())[0]
+        caption = f"📊 <b>Статистика</b>\n\nПользователей: {users}\nМероприятий: {events}\nРегистраций: {regs}"
+        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
         await callback.answer()
         return
 
     if data == "mod_create_event":
-        await callback.message.edit_text(
+        caption = (
             "✏️ <b>Создание мероприятия</b>\n\n"
             "Отправьте данные в формате:\n"
-            "<code>Название | Описание | Дата (ГГГГ-ММ-ДД ЧЧ:ММ) | Место</code>\n\n"
-            "Пример:\n"
-            "<code>День открытых дверей | Приёмная комиссия ответит на вопросы | 2025-12-10 12:00 | Главный корпус</code>",
-            parse_mode="HTML"
+            "<code>Название | Описание | Дата (ГГГГ-ММ-ДД ЧЧ:ММ) | Место</code>"
         )
-        # Сохрани состояние: ждём ввод от модератора
-        # Для простоты на хакатоне — просто установим флаг в памяти (в реальном проекте — FSM)
+        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
         context = dp.get("mod_context", {})
         context[callback.from_user.id] = "awaiting_event_data"
         dp["mod_context"] = context
@@ -504,15 +510,13 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "mod_set_role":
-        await callback.message.edit_text(
+        caption = (
             "👤 <b>Назначение роли</b>\n\n"
             "Отправьте в формате:\n"
             "<code>tg_id роль</code>\n\n"
-            "Роли: <code>applicant</code>, <code>student</code>, <code>curator</code>, <code>moderator</code>\n\n"
-            "Пример:\n"
-            "<code>123456789 curator</code>",
-            parse_mode="HTML"
+            "Роли: <code>applicant</code>, <code>student</code>, <code>curator</code>, <code>moderator</code>"
         )
+        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
         context = dp.get("mod_context", {})
         context[callback.from_user.id] = "awaiting_role_data"
         dp["mod_context"] = context
@@ -520,11 +524,8 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "mod_search_user":
-        await callback.message.edit_text(
-            "🔍 <b>Поиск пользователя</b>\n\n"
-            "Отправьте <b>Telegram ID</b> пользователя:",
-            parse_mode="HTML"
-        )
+        caption = "🔍 <b>Поиск пользователя</b>\n\nОтправьте <b>Telegram ID</b> пользователя:"
+        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
         context = dp.get("mod_context", {})
         context[callback.from_user.id] = "awaiting_user_id"
         dp["mod_context"] = context
@@ -532,11 +533,8 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "mod_broadcast":
-        await callback.message.edit_text(
-            "📨 <b>Рассылка</b>\n\n"
-            "Отправьте текст сообщения для всех пользователей с включёнными уведомлениями:",
-            parse_mode="HTML"
-        )
+        caption = "📨 <b>Рассылка</b>\n\nОтправьте текст сообщения для всех пользователей с включёнными уведомлениями:"
+        await callback.message.edit_caption(caption=caption, reply_markup=back_to_moder_kb(), parse_mode="HTML")
         context = dp.get("mod_context", {})
         context[callback.from_user.id] = "awaiting_broadcast_text"
         dp["mod_context"] = context
@@ -544,36 +542,36 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "back_to_moder":
-        builder = InlineKeyboardBuilder()
-        builder.button(text="📊 Статистика", callback_data="mod_stats")
-        builder.button(text="📨 Рассылка (демо)", callback_data="mod_broadcast_demo")
-        builder.adjust(1)
-        await callback.message.edit_text("🛠 Панель модератора:", reply_markup=builder.as_markup())
+        caption = "🛠 <b>Панель модератора</b>"
+        await callback.message.edit_caption(
+            caption=caption,
+            reply_markup=moder_menu_kb(),
+            parse_mode="HTML"
+        )
         await callback.answer()
         return
 
     if data == "back_to_main":
-        gif_file = BufferedInputFile(WELCOME_GIF_BYTES, filename="bot.mp4")
-        await callback.message.answer_animation(
-            animation=gif_file,
-            caption=(
-                "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
-                "Здесь вы можете:\n"
-                "• Получить персональный QR-код\n"
-                "• Зарегистрироваться на мероприятия\n"
-                "• Настроить уведомления"
-            ),
-            reply_markup=main_menu_kb()
+        caption = (
+            "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
+            "Здесь вы можете:\n"
+            "• Получить персональный QR-код\n"
+            "• Зарегистрироваться на мероприятия\n"
+            "• Настроить уведомления"
         )
+        await callback.message.edit_caption(caption=caption, reply_markup=main_menu_kb(), parse_mode="HTML")
         await callback.answer()
         return
 
     await callback.answer()
 
 
+# === Запуск ===
+
 async def main():
-    global WELCOME_GIF_BYTES
+    global WELCOME_GIF_BYTES, MODER_GIF_PATH
     WELCOME_GIF_BYTES = load_welcome_gif()
+    MODER_GIF_PATH = load_moder_gif()
     await init_db()
     me = await bot.get_me()
     print(f"✅ Бот запущен как @{me.username}")
