@@ -2,6 +2,9 @@ import asyncio
 import aiosqlite
 import os
 import qrcode
+import feedparser
+import asyncio
+from datetime import datetime, timezone
 from PIL import Image, ImageDraw
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types
@@ -19,6 +22,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODERATOR_TG_ID = os.getenv("MODER_ID")
 BOT_USERNAME = "abitohelp_bot"
 
+LAST_PROCESSED_LINK = None
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в .env")
 
@@ -34,6 +39,79 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 # === Вспомогательные функции ===
+
+async def rss_monitor():
+    global LAST_PROCESSED_LINK
+    rss_url = "https://www.vsu.ru/ru/news/rss"
+
+    # Загружаем последнюю известную новость при старте
+    feed = feedparser.parse(rss_url)
+    if feed.entries:
+        LAST_PROCESSED_LINK = feed.entries[0].link
+
+    while True:
+        try:
+            feed = feedparser.parse(rss_url)
+            new_news = []
+
+            for entry in feed.entries:
+                # Останавливаемся, когда дошли до уже обработанной новости
+                if entry.link == LAST_PROCESSED_LINK:
+                    break
+                new_news.append(entry)
+
+            # Обрабатываем в обратном порядке (от старых к новым), чтобы сохранить хронологию
+            new_news.reverse()
+
+            if new_news:
+                # Сохраняем самую свежую ссылку
+                LAST_PROCESSED_LINK = feed.entries[0].link
+
+                # Получаем ID пользователей, подписанных на новости
+                async with aiosqlite.connect(DB_PATH) as db:
+                    cursor = await db.execute("""
+                        SELECT u.tg_id FROM users u
+                        JOIN notification_prefs np ON u.tg_id = np.user_id
+                        WHERE np.news_enabled = 1
+                    """)
+                    recipients = [row[0] for row in await cursor.fetchall()]
+
+                # Рассылаем каждую новость
+                for entry in new_news:
+                    title = entry.title
+                    description = entry.description or ""
+                    link = entry.link
+                    pub_date = entry.get('published', '')
+
+                    # Форматируем дату (опционально)
+                    try:
+                        dt = datetime.strptime(pub_date, "%a, %d %b % %H:%M:%S %z")
+                        date_str = dt.strftime("%d.%m.%Y")
+                    except:
+                        date_str = ""
+
+                    text = f"🗞 <b>{title}</b>\n\n{description}\n\n<a href='{link}'>Читать далее</a>"
+                    if date_str:
+                        text = f"📅 {date_str}\n" + text
+
+                    for tg_id in recipients:
+                        try:
+                            await bot.send_message(
+                                tg_id,
+                                text,
+                                parse_mode="HTML",
+                                disable_web_page_preview=False
+                            )
+                            await asyncio.sleep(0.05)  # избегаем лимитов Telegram
+                        except Exception:
+                            pass  # пользователь заблокировал бота
+
+        except Exception as e:
+            print(f"[RSS] Ошибка: {e}")
+
+        # Проверяем каждые 10 минут
+        await asyncio.sleep(600)
+
 
 class EventCreation(StatesGroup):
     title = State()
@@ -183,10 +261,11 @@ async def start_user_search(message: types.Message, state: FSMContext):
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    # Первая строка: О боте + Новости
     builder.button(text="ℹ️ О боте", callback_data="about_bot")
     builder.button(text="👤 Мой профиль", callback_data="my_profile")
-    builder.button(text="🎫 Мой QR-код", callback_data="my_qr_card")
-    builder.button(text="📅 Активные регистрации", callback_data="active_events")
+    builder.button(text="📰 Новости", callback_data="latest_news")
+    builder.button(text="📅 Активные мероприятия", callback_data="active_events")
     builder.button(text="🔔 Настройки уведомлений", callback_data="notif_settings")
     builder.adjust(1)
     return builder.as_markup()
@@ -224,7 +303,9 @@ def event_register_kb(event_id: int) -> InlineKeyboardMarkup:
 def profile_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✌️ QR для отметки", callback_data="qr_for_checkin")
+    builder.button(text="🎫 Мой QR-код", callback_data="my_qr_card")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -240,16 +321,31 @@ def event_registered_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def notif_toggle_kb(events_on: bool) -> InlineKeyboardMarkup:
+def notif_toggle_kb(events_on: bool, news_on: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    status = "✅ Включены" if events_on else "❌ Выключены"
-    builder.button(text=f"Мероприятия: {status}", callback_data="toggle_events")
+    
+    events_status = "✅ Включены" if events_on else "❌ Выключены"
+    news_status = "✅ Включены" if news_on else "❌ Выключены"
+    
+    builder.button(text=f"Мероприятия: {events_status}", callback_data="toggle_events")
+    builder.button(text=f"Новости: {news_status}", callback_data="toggle_news")
     builder.button(text="⬅️ Назад", callback_data="back_to_main")
     builder.adjust(1)
     return builder.as_markup()
 
 
 # === Обработчики ===
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("ℹ️ Нет активной операции для отмены.")
+        return
+
+    await state.clear()
+    await message.answer("❌ Операция отменена. Вы можете начать заново.")
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -755,17 +851,6 @@ async def cmd_set_video(message: types.Message):
     await message.answer(f"✅ Видео для '{key}' сохранено!")
 
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("Нет активной операции для отмены.")
-        return
-
-    await state.clear()
-    await message.answer("❌ Операция отменена. Вы можете начать заново.")
-
-
 # === Обработчик кнопок — ТОЛЬКО edit_caption! ===
 
 @dp.callback_query()
@@ -913,9 +998,17 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
 
     if data == "notif_settings":
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT events_enabled FROM notification_prefs WHERE user_id = ?", (user.id,))
+            cursor = await db.execute(
+                "SELECT events_enabled, news_enabled FROM notification_prefs WHERE user_id = ?",
+                (user.id,)
+            )
             row = await cursor.fetchone()
-        events_on = bool(row[0]) if row else True
+        
+        # Если настроек нет (маловероятно, но на всякий случай)
+        if row:
+            events_on, news_on = bool(row[0]), bool(row[1])
+        else:
+            events_on, news_on = True, True
 
         text = "🔔 <b>Настройки уведомлений</b>"
         notif_video_id = await get_media_asset("notifications")
@@ -928,28 +1021,64 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
             )
             await callback.message.edit_media(
                 media=media,
-                reply_markup=notif_toggle_kb(events_on),
+                reply_markup=notif_toggle_kb(events_on, news_on),
                 parse_mode="HTML"
             )
         else:
-            await callback.message.answer(
-                text,
-                reply_markup=notif_toggle_kb(events_on),
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=notif_toggle_kb(events_on, news_on),
                 parse_mode="HTML"
             )
         await callback.answer()
         return
 
     if data == "toggle_events":
+        # Переключаем events_enabled
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE notification_prefs SET events_enabled = 1 - events_enabled WHERE user_id = ?", (user.id,))
             await db.commit()
+
+        # Получаем ОБА текущих значения — и для мероприятий, и для новостей
         async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT events_enabled FROM notification_prefs WHERE user_id = ?", (user.id,))
+            cursor = await db.execute(
+                "SELECT events_enabled, news_enabled FROM notification_prefs WHERE user_id = ?",
+                (user.id,)
+            )
             row = await cursor.fetchone()
-        events_on = bool(row[0]) if row else True
+            events_on = bool(row[0]) if row else True
+            news_on = bool(row[1]) if row else True
+
         caption = "🔔 <b>Настройки уведомлений</b>"
-        await callback.message.edit_caption(caption=caption, reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
+        await callback.message.edit_caption(
+            caption=caption,
+            reply_markup=notif_toggle_kb(events_on, news_on),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    if data == "toggle_news":
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE notification_prefs SET news_enabled = 1 - news_enabled WHERE user_id = ?", (user.id,))
+            await db.commit()
+        
+        # Получаем актуальные значения
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT events_enabled, news_enabled FROM notification_prefs WHERE user_id = ?",
+                (user.id,)
+            )
+            row = await cursor.fetchone()
+            events_on = bool(row[0]) if row else True
+            news_on = bool(row[1]) if row else True
+
+        caption = "🔔 <b>Настройки уведомлений</b>"
+        await callback.message.edit_caption(
+            caption=caption,
+            reply_markup=notif_toggle_kb(events_on, news_on),
+            parse_mode="HTML"
+        )
         await callback.answer()
         return
 
@@ -1043,9 +1172,9 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
             events = await cursor.fetchall()
 
         if not events:
-            welcome_file_id = await get_media_asset("welcome")
+            regs_file_id = await get_media_asset("regs")
             media = InputMediaAnimation(
-                media=welcome_file_id,
+                media=regs_file_id,
                 caption="📭 Нет мероприятий с открытой регистрацией.",
                 parse_mode="HTML"
             )
@@ -1078,7 +1207,43 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
         # Сохрани список в state (для навигации)
         await callback.answer()
 
-    # === Модераторка (редактируем caption) ===
+    if data == "latest_news":
+        try:
+            import feedparser
+            feed = feedparser.parse("https://www.vsu.ru/ru/news/rss")
+            if not feed.entries:
+                raise Exception("Нет новостей")
+
+            # Берём 3 свежие новости
+            entries = feed.entries[:3]
+            text = "📰 <b>Последние новости ВГУ</b>\n\n"
+            for entry in entries:
+                title = entry.title.strip()
+                link = entry.link
+                # Обрезаем длинные заголовки
+                if len(title) > 60:
+                    title = title[:57] + "..."
+                text += f"• <a href='{link}'>{title}</a>\n"
+
+            text += "\n🔔 Новости приходят автоматически, если у вас включены уведомления."
+        except Exception as e:
+            text = "📭 Новости временно недоступны.\nПопробуйте позже."
+
+        # Попробуем загрузить видео для фона (опционально)
+        news_video_id = await get_media_asset("news")
+        if news_video_id:
+            media = InputMediaAnimation(
+                media=news_video_id,
+                caption=text,
+                parse_mode="HTML"
+            )
+            await callback.message.edit_media(media=media, reply_markup=back_kb())
+        else:
+            await callback.message.edit_text(text=text, reply_markup=back_kb(), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    # === Модераторка ===
 
     if data == "mod_stats":
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1118,7 +1283,7 @@ async def handle_callback(callback: types.CallbackQuery, state: FSMContext):
         await state.set_state(Broadcast.waiting_for_message)
         await callback.message.answer(
             "📨 Отправьте текст (или текст + фото/видео) для рассылки.\n"
-            "Поддерживается HTML-разметка и медиа."
+            "Поддерживается HTML-разметка и медиа.\nОформите полное, подробное содержание поста."
         )
         await callback.answer()
         return
@@ -1174,6 +1339,7 @@ async def main():
     await init_db()
     me = await bot.get_me()
     print(f"✅ Бот запущен как @{me.username}")
+    asyncio.create_task(rss_monitor())
     await dp.start_polling(bot)
 
 
