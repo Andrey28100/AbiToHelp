@@ -11,10 +11,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 
-# === Конфигурация ===
-WELCOME_GIF_PATH = "bot.mp4"
-MODER_GIF_PATH = "moder.mp4"
-
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MODERATOR_TG_ID = os.getenv("MODER_ID")
@@ -86,6 +82,19 @@ async def init_db():
             key TEXT PRIMARY KEY,
             file_id TEXT NOT NULL,
             description TEXT
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS registrations (
+            user_id INTEGER,
+            event_id INTEGER,
+            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status TEXT DEFAULT 'confirmed',
+            attended BOOLEAN DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(tg_id),
+            FOREIGN KEY(event_id) REFERENCES events(id),
+            PRIMARY KEY(user_id, event_id)
         )
         """)
 
@@ -174,6 +183,13 @@ def event_register_kb(event_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def profile_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✌️ QR для отметки", callback_data="qr_for_checkin")
+    builder.button(text="⬅️ Назад", callback_data="back_to_main")
+    return builder.as_markup()
+
+
 def event_registered_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Зарегистрировано", callback_data="noop")
@@ -211,6 +227,51 @@ async def cmd_start(message: types.Message):
         parts = message.text.split(maxsplit=1)
         if len(parts) > 1:
             payload = parts[1].strip()
+
+    if payload and payload.startswith("checkin_"):
+        try:
+            _, event_id_str, attendee_id_str = payload.split("_")
+            event_id = int(event_id_str)
+            attendee_id = int(attendee_id_str)
+        except (ValueError, IndexError):
+            await message.answer("❌ Некорректная ссылка для отметки.")
+            return
+
+        # Проверяем: текущий пользователь — модератор?
+        if not await has_admin_access(user.id):
+            await message.answer("⚠️ Только модератор может ставить отметки о посещении.")
+            return
+
+        # Проверяем: зарегистрирован ли attendee на это мероприятие?
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT 1 FROM registrations
+                WHERE user_id = ? AND event_id = ?
+            """, (attendee_id, event_id))
+            if not await cursor.fetchone():
+                await message.answer("❌ Пользователь не зарегистрирован на это мероприятие.")
+                return
+
+            # Ставим attended = 1
+            await db.execute("""
+                UPDATE registrations
+                SET attended = 1
+                WHERE user_id = ? AND event_id = ?
+            """, (attendee_id, event_id))
+            await db.commit()
+
+            # Получаем имена для отчёта
+            cursor = await db.execute("SELECT full_name FROM users WHERE tg_id = ?", (attendee_id,))
+            attendee_name = (await cursor.fetchone())[0] if cursor else f"ID{attendee_id}"
+            cursor = await db.execute("SELECT title FROM events WHERE id = ?", (event_id,))
+            event_title = (await cursor.fetchone())[0] if cursor else f"Мероприятие {event_id}"
+
+        await message.answer(
+            f"✅ Отметка о посещении проставлена!\n\n"
+            f"👤 {attendee_name}\n"
+            f"📅 {event_title}"
+        )
+        return
 
     if payload and payload.isdigit():
         target_id = int(payload)
@@ -465,11 +526,9 @@ async def handle_callback(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # === Все экраны — через edit_caption ===
-
     if data == "about_bot":
         about_video_id = await get_media_asset("about")
-        text = "ℹ️ <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия."
+        text = "ℹ️ <b>Бот абитуриента и студента ВГУ</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия. \nБот центра адаптации абитуриентов Воронежского государственного университета"
 
         media = InputMediaAnimation(
             media=about_video_id,
@@ -515,6 +574,7 @@ async def handle_callback(callback: types.CallbackQuery):
                 """, (user.id,))
                 events = await cursor.fetchall()
 
+
                 text = f"👤 <b>Ваш профиль</b>\n\nИмя: {full_name}\nРоль: {role_name}"
                 if events:
                     text += "\n\n✅ Зарегистрирован на:\n" + "\n".join(f"• {title} ({dt})" for title, dt in events)
@@ -530,13 +590,13 @@ async def handle_callback(callback: types.CallbackQuery):
             )
             await callback.message.edit_media(
                 media=media,
-                reply_markup=back_kb(),
+                reply_markup=profile_kb(),
                 parse_mode="HTML"
             )
         else:
             await callback.message.edit_caption(
                 caption=text,
-                reply_markup=back_kb(),
+                reply_markup=profile_kb(),
                 parse_mode="HTML"
             )
         await callback.answer()
@@ -600,6 +660,78 @@ async def handle_callback(callback: types.CallbackQuery):
         events_on = bool(row[0]) if row else True
         caption = "🔔 <b>Настройки уведомлений</b>"
         await callback.message.edit_caption(caption=caption, reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if data == "qr_for_checkin":
+        # Получаем список мероприятий
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("""
+                SELECT e.id, e.title FROM events e
+                JOIN registrations r ON e.id = r.event_id
+                WHERE r.user_id = ?
+            """, (user.id,))
+            events = await cursor.fetchall()
+
+        select_media_file_id = await get_media_asset("select")
+
+        if not events:
+            # Показываем ошибку через edit_media (не edit_text!)
+            error_caption = "📭 Вы не записаны ни на одно мероприятие."
+            fallback_media = InputMediaAnimation(
+                media=select_media_file_id,
+                caption=error_caption,
+                parse_mode="HTML"
+            )
+            await callback.message.edit_media(media=fallback_media, reply_markup=back_kb())
+            await callback.answer()
+            return
+
+        # Формируем текст для caption
+        event_list = "\n".join(
+            f"• {title}" for _, title in events
+        )
+        caption = f"Выберите мероприятие для генерации QR:\n\n{event_list}"
+
+        select_media = InputMediaAnimation(
+            media=select_media_file_id,
+            caption=caption,
+            parse_mode="HTML"
+        )
+
+        # Клавиатура с кнопками на каждое мероприятие
+        builder = InlineKeyboardBuilder()
+        for event_id, title in events:
+            builder.button(
+                text=title[:20] + ("..." if len(title) > 20 else ""),
+                callback_data=f"gen_qr_checkin_{event_id}"
+            )
+        builder.button(text="⬅️ Назад", callback_data="my_profile")
+        builder.adjust(1)
+
+        await callback.message.edit_media(
+            media=select_media,
+            reply_markup=builder.as_markup()
+        )
+        await callback.answer()
+        return
+
+    if data.startswith("gen_qr_checkin_"):
+        event_id = int(data.split("_")[-1])
+        deeplink = f"https://t.me/{BOT_USERNAME}?start=checkin_{event_id}_{user.id}"
+        qr_gif = generate_qr_gif(deeplink)
+
+        media = InputMediaAnimation(
+                media=BufferedInputFile(qr_gif.getvalue(), filename=f"qr_checkin_{event_id}.gif"),
+                caption=error_caption,
+                parse_mode="HTML"
+            )
+
+        await callback.message.edit_media(
+            media=media,
+            caption=f"🎫 QR для отметки на мероприятии\n\nПокажите его модератору при входе.",
+            reply_markup=back_kb()
+        )
         await callback.answer()
         return
 
