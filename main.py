@@ -2,6 +2,7 @@ import asyncio
 import aiosqlite
 import os
 import qrcode
+from PIL import Image, ImageDraw
 from io import BytesIO
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -109,6 +110,20 @@ def generate_qr(data: str) -> BytesIO:
     return bio
 
 
+def generate_qr_gif(data: str) -> BytesIO:
+    # Генерируем QR-код как изображение
+    qr = qrcode.QRCode(version=1, box_size=8, border=2)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+    # Создаём GIF (один кадр)
+    gif_bio = BytesIO()
+    img.save(gif_bio, format="GIF")
+    gif_bio.seek(0)
+    return gif_bio
+
+
 async def has_admin_access(tg_id: int) -> bool:
     if tg_id == MODERATOR_TG_ID:
         return True
@@ -122,7 +137,7 @@ async def has_admin_access(tg_id: int) -> bool:
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🤖 О боте", callback_data="about_bot")
+    builder.button(text="ℹ️ О боте", callback_data="about_bot")
     builder.button(text="👤 Мой профиль", callback_data="my_profile")
     builder.button(text="🎫 Мой QR-код", callback_data="my_qr_card")
     builder.button(text="🔔 Настройки уведомлений", callback_data="notif_settings")
@@ -453,56 +468,96 @@ async def handle_callback(callback: types.CallbackQuery):
     # === Все экраны — через edit_caption ===
 
     if data == "about_bot":
-        caption = "🤖 <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия."
-        await callback.message.edit_caption(caption=caption, reply_markup=back_kb(), parse_mode="HTML")
+        about_video_id = await get_media_asset("about")
+        text = "ℹ️ <b>Бот абитуриента</b>\n\nПомогает ориентироваться в университете и регистрироваться на мероприятия."
+
+        media = InputMediaAnimation(
+            media=about_video_id,
+            caption=text,
+            parse_mode="HTML"
+        )
+
+        if about_video_id:
+            await callback.message.edit_media(
+                media=media,
+                reply_markup=back_kb(),
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.edit_caption(
+                text,
+                reply_markup=back_kb(),
+                parse_mode="HTML"
+            )
         await callback.answer()
         return
 
     if data == "my_profile":
-        user_id = user.id
+        # Получаем видео, если есть
+        profile_video_id = await get_media_asset("profile")
+        
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute(
                 "SELECT full_name, username, role FROM users WHERE tg_id = ?",
-                (user_id,)
+                (user.id,)
             )
             row = await cursor.fetchone()
             if not row:
-                caption = "❌ Профиль не найден. Напишите /start."
-                await callback.message.edit_caption(caption=caption, reply_markup=back_kb())
-                await callback.answer()
-                return
+                text = "❌ Профиль не найден. Напишите /start."
+            else:
+                full_name, username, role = row
+                role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
 
-            full_name, username, role = row
-            role_name = {"applicant": "Абитуриент", "student": "Студент", "curator": "Куратор", "moderator": "Модератор"}.get(role, role)
+                cursor = await db.execute("""
+                    SELECT e.title, e.event_datetime FROM events e
+                    JOIN registrations r ON e.id = r.event_id
+                    WHERE r.user_id = ?
+                """, (user.id,))
+                events = await cursor.fetchall()
 
-            cursor = await db.execute("""
-                SELECT e.title, e.event_datetime FROM events e
-                JOIN registrations r ON e.id = r.event_id
-                WHERE r.user_id = ?
-            """, (user_id,))
-            events = await cursor.fetchall()
+                text = f"👤 <b>Ваш профиль</b>\n\nИмя: {full_name}\nРоль: {role_name}"
+                if events:
+                    text += "\n\n✅ Зарегистрирован на:\n" + "\n".join(f"• {title} ({dt})" for title, dt in events)
+                else:
+                    text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
 
-        text = f"👤 <b>Ваш профиль</b>\n\nИмя: {full_name}\nРоль: {role_name}"
-        if events:
-            text += "\n\n✅ Зарегистрирован на:\n" + "\n".join(f"• {title} ({dt})" for title, dt in events)
+        # Отправляем ВИДЕО + текст, если видео есть, иначе только текст
+        if profile_video_id:
+            media = InputMediaAnimation(
+                media=profile_video_id,
+                caption=text,
+                parse_mode="HTML"
+            )
+            await callback.message.edit_media(
+                media=media,
+                reply_markup=back_kb(),
+                parse_mode="HTML"
+            )
         else:
-            text += "\n\n📭 Не зарегистрирован ни на одно мероприятие."
-
-        await callback.message.edit_caption(caption=text, reply_markup=back_kb(), parse_mode="HTML")
+            await callback.message.edit_caption(
+                caption=text,
+                reply_markup=back_kb(),
+                parse_mode="HTML"
+            )
         await callback.answer()
         return
 
     if data == "my_qr_card":
         # QR — отдельное сообщение (не редактируем текущее)
         deeplink_url = f"https://t.me/{BOT_USERNAME}?start={user.id}"
-        qr_img = generate_qr(deeplink_url)
-        photo_file = BufferedInputFile(qr_img.getvalue(), filename="qr_vizitka.png")
+        qr_gif = generate_qr_gif(deeplink_url)
+        gif_file = BufferedInputFile(qr_gif.getvalue(), filename="qr_vizitka.gif")
         caption = (
             "🎫 <b>Ваш персональный QR-код</b>\n\n"
             "При сканировании другие увидят ваш профиль и список мероприятий, на которые вы записаны.\n\n"
             f"🔗 <code>{deeplink_url}</code>"
         )
-        await callback.message.answer_photo(photo=photo_file, caption=caption, parse_mode="HTML")
+        media = InputMediaAnimation(
+            media=gif_file,
+            caption=caption,
+            parse_mode="HTML"
+        )
+        await callback.message.edit_media(media=media, reply_markup=back_kb(), parse_mode="HTML")
         await callback.answer()
         return
 
@@ -512,8 +567,26 @@ async def handle_callback(callback: types.CallbackQuery):
             row = await cursor.fetchone()
         events_on = bool(row[0]) if row else True
 
-        caption = "🔔 <b>Настройки уведомлений</b>"
-        await callback.message.edit_caption(caption=caption, reply_markup=notif_toggle_kb(events_on), parse_mode="HTML")
+        text = "🔔 <b>Настройки уведомлений</b>"
+        notif_video_id = await get_media_asset("notifications")
+
+        if notif_video_id:
+            media = InputMediaAnimation(
+                media=notif_video_id,
+                caption=text,
+                parse_mode="HTML"
+            )
+            await callback.message.edit_media(
+                media=media,
+                reply_markup=notif_toggle_kb(events_on),
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.answer(
+                text,
+                reply_markup=notif_toggle_kb(events_on),
+                parse_mode="HTML"
+            )
         await callback.answer()
         return
 
@@ -601,6 +674,7 @@ async def handle_callback(callback: types.CallbackQuery):
         return
 
     if data == "back_to_main":
+        welcome_file_id = await get_media_asset("welcome")
         caption = (
             "🎓 Добро пожаловать в бот поддержки абитуриентов!\n\n"
             "Здесь вы можете:\n"
@@ -608,7 +682,13 @@ async def handle_callback(callback: types.CallbackQuery):
             "• Зарегистрироваться на мероприятия\n"
             "• Настроить уведомления"
         )
-        await callback.message.edit_caption(caption=caption, reply_markup=main_menu_kb(), parse_mode="HTML")
+        media = InputMediaAnimation(
+            media=welcome_file_id,
+            caption=caption,
+            parse_mode="HTML"
+        )
+
+        await callback.message.edit_media(media=media, reply_markup=main_menu_kb(), parse_mode="HTML")
         await callback.answer()
         return
 
